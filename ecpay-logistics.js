@@ -116,28 +116,32 @@ function generateCvsMapParams(merchant, data, callbackUrl) {
 function generateCreateShipmentParams(merchant, data, hashKey, hashIv) {
   const tradeNo = data.merchant_trade_no || generateLogisticsTradeNo();
   
+  // ⚠️ 重要：ECPay 所有參數必須是字串
   const params = {
-    MerchantID: merchant.ecpay_merchant_id,
-    MerchantTradeNo: tradeNo,
+    MerchantID: String(merchant.ecpay_merchant_id),
+    MerchantTradeNo: String(tradeNo),
     MerchantTradeDate: dayjs().format('YYYY/MM/DD HH:mm:ss'),
     LogisticsType: 'CVS',
     LogisticsSubType: CVS_TYPE_MAP[data.cvs_sub_type] || 'UNIMARTC2C',
-    GoodsAmount: data.goods_amount || 1,
-    GoodsName: (data.goods_name || '商品').substring(0, 60),
-    SenderName: (data.sender_name || '敏捷商店').substring(0, 10),
-    SenderPhone: data.sender_phone || '',
-    SenderCellPhone: data.sender_cellphone || '0912345678',
-    ReceiverName: data.receiver_name.substring(0, 10),
-    ReceiverPhone: data.receiver_phone || '',
-    ReceiverCellPhone: data.receiver_cellphone || data.receiver_phone,
-    ReceiverEmail: data.receiver_email || '',
-    ReceiverStoreID: data.receiver_store_id,
-    TradeDesc: (data.trade_desc || '網路購物').substring(0, 200),
-    ServerReplyURL: data.server_reply_url,
+    GoodsAmount: String(data.goods_amount || 1),
+    GoodsName: String(data.goods_name || '商品').substring(0, 60),
+    SenderName: String(data.sender_name || '測試寄件').substring(0, 10),
+    SenderCellPhone: String(data.sender_cellphone || '0912345678'),
+    ReceiverName: String(data.receiver_name).substring(0, 10),
+    ReceiverCellPhone: String(data.receiver_cellphone || data.receiver_phone),
+    ReceiverStoreID: String(data.receiver_store_id),
+    TradeDesc: String(data.trade_desc || '網路購物').substring(0, 200),
+    ServerReplyURL: String(data.server_reply_url || ''),
     IsCollection: data.is_collection ? 'Y' : 'N',
-    CollectionAmount: data.is_collection ? (data.collection_amount || data.goods_amount) : 0,
-    Platform: ''
+    CollectionAmount: String(data.is_collection ? (data.collection_amount || data.goods_amount || 0) : 0)
   };
+  
+  // 移除空值參數（避免 undefined 參與簽章）
+  Object.keys(params).forEach(key => {
+    if (params[key] === '' || params[key] === 'undefined' || params[key] === undefined) {
+      delete params[key];
+    }
+  });
   
   // 生成 CheckMacValue
   params.CheckMacValue = generateCheckMacValue(params, hashKey, hashIv);
