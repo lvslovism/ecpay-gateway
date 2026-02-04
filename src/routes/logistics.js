@@ -1,522 +1,237 @@
 /**
- * 物流 API - 超商取貨
+ * ECPay 物流服務 - 超商取貨
  */
-const express = require('express');
-const router = express.Router();
-const supabase = require('../services/supabase');
-const { decrypt } = require('../services/crypto');
-const { authMiddleware } = require('../middleware/auth');
-const {
-  generateLogisticsTradeNo,
-  generateCvsMapParams,
-  generateCreateShipmentParams,
-  generateMapFormHtml,
-  verifyCheckMacValue,
-  parseLogisticsStatus,
-  getApiUrl
-} = require('../services/ecpay-logistics');
+const crypto = require('crypto');
+const dayjs = require('dayjs');
 
-/**
- * POST /api/v1/logistics/cvs-map
- * 取得超商地圖選店 URL
- */
-router.post('/cvs-map', authMiddleware, async (req, res) => {
-  try {
-    const { cvs_type = 'UNIMART', is_collection = false, extra_data = '' } = req.body;
-    const merchant = req.merchant;
-    
-    const gatewayUrl = process.env.GATEWAY_URL || `https://${req.get('host')}`;
-    const callbackUrl = `${gatewayUrl}/api/v1/logistics/cvs-map/callback`;
-    
-    // 生成參數
-    const { params, tradeNo } = generateCvsMapParams(merchant, {
-      cvs_type,
-      is_collection,
-      extra_data
-    }, callbackUrl);
-    
-    // 儲存到暫存表
-    const { error: insertError } = await supabase
-      .from('gateway_cvs_selections')
-      .insert({
-        merchant_id: merchant.id,
-        temp_trade_no: tradeNo,
-        cvs_sub_type: cvs_type,
-        extra_data,
-        expires_at: new Date(Date.now() + 30 * 60 * 1000)
-      });
-    
-    if (insertError) throw insertError;
-    
-    // 回傳地圖 URL
-    const mapUrl = `${gatewayUrl}/api/v1/logistics/cvs-map/${tradeNo}`;
-    
-    res.json({
-      success: true,
-      temp_trade_no: tradeNo,
-      map_url: mapUrl,
-      expires_in: 1800 // 30 分鐘
-    });
-    
-  } catch (error) {
-    console.error('CVS map error:', error);
-    res.status(500).json({ error: 'Failed to generate CVS map URL' });
+// 綠界物流 API 端點
+const ECPAY_LOGISTICS_URL = {
+  staging: {
+    map: 'https://logistics-stage.ecpay.com.tw/Express/map',
+    create: 'https://logistics-stage.ecpay.com.tw/Express/Create',
+    query: 'https://logistics-stage.ecpay.com.tw/Helper/QueryLogisticsTradeInfo/V4'
+  },
+  production: {
+    map: 'https://logistics.ecpay.com.tw/Express/map',
+    create: 'https://logistics.ecpay.com.tw/Express/Create',
+    query: 'https://logistics.ecpay.com.tw/Helper/QueryLogisticsTradeInfo/V4'
   }
-});
+};
+
+// 超商類型對應
+const CVS_TYPE_MAP = {
+  'FAMI': 'FAMIC2C',
+  'UNIMART': 'UNIMARTC2C',
+  'HILIFE': 'HILIFEC2C',
+  'FAMIC2C': 'FAMIC2C',
+  'UNIMARTC2C': 'UNIMARTC2C',
+  'HILIFEC2C': 'HILIFEC2C'
+};
 
 /**
- * GET /api/v1/logistics/cvs-map/:tradeNo
- * 跳轉到綠界超商地圖頁面
+ * 生成物流交易編號
  */
-router.get('/cvs-map/:tradeNo', async (req, res) => {
-  try {
-    const { tradeNo } = req.params;
-    
-    // 查詢暫存
-    const { data: selection, error } = await supabase
-      .from('gateway_cvs_selections')
-      .select('*, gateway_merchants(*)')
-      .eq('temp_trade_no', tradeNo)
-      .eq('is_used', false)
-      .single();
-    
-    if (error || !selection) {
-      return res.status(404).send('<h1>連結已過期或不存在</h1>');
-    }
-    
-    const merchant = selection.gateway_merchants;
-    const gatewayUrl = process.env.GATEWAY_URL || `https://${req.get('host')}`;
-    const callbackUrl = `${gatewayUrl}/api/v1/logistics/cvs-map/callback`;
-    
-    // 重新生成參數（使用相同 tradeNo）
-    const params = {
-      MerchantID: merchant.ecpay_merchant_id,
-      MerchantTradeNo: tradeNo,
-      LogisticsType: 'CVS',
-      LogisticsSubType: selection.cvs_sub_type || 'UNIMARTC2C',
-      IsCollection: selection.extra_data?.includes('collection') ? 'Y' : 'N',
-      ServerReplyURL: callbackUrl,
-      ExtraData: selection.extra_data || ''
-    };
-    
-    // 生成表單 HTML
-    const formHtml = generateMapFormHtml(params, merchant.is_staging);
-    
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(formHtml);
-    
-  } catch (error) {
-    console.error('CVS map redirect error:', error);
-    res.status(500).send('<h1>系統錯誤</h1>');
+function generateLogisticsTradeNo() {
+  const date = dayjs().format('YYMMDDHHmmss');
+  const random = crypto.randomBytes(4).toString('hex').toUpperCase().substring(0, 6);
+  return `${date}${random}`;
+}
+
+/**
+ * 生成 CheckMacValue (物流用 MD5)
+ */
+function generateCheckMacValue(params, hashKey, hashIv) {
+  // 按照 key 排序（不分大小寫）
+  const sortedKeys = Object.keys(params).sort((a, b) => 
+    a.toLowerCase().localeCompare(b.toLowerCase())
+  );
+  
+  // 組合參數字串：HashKey={value}&key1={value1}&key2={value2}&HashIV={value}
+  let rawStr = `HashKey=${hashKey}`;
+  sortedKeys.forEach(key => {
+    rawStr += `&${key}=${params[key]}`;
+  });
+  rawStr += `&HashIV=${hashIv}`;
+  
+  // URL encode (使用 .NET 相容的 encode)
+  let encodedStr = encodeURIComponent(rawStr);
+  
+  // 轉小寫
+  encodedStr = encodedStr.toLowerCase();
+  
+  // 綠界特殊字元還原
+  encodedStr = encodedStr
+    .replace(/%2d/g, '-')
+    .replace(/%5f/g, '_')
+    .replace(/%2e/g, '.')
+    .replace(/%21/g, '!')
+    .replace(/%2a/g, '*')
+    .replace(/%28/g, '(')
+    .replace(/%29/g, ')')
+    .replace(/%20/g, '+');
+  
+  // Debug log
+  console.log('CheckMac raw string:', rawStr.substring(0, 100) + '...');
+  console.log('CheckMac encoded:', encodedStr.substring(0, 100) + '...');
+  
+  // MD5 雜湊
+  const hash = crypto.createHash('md5').update(encodedStr).digest('hex');
+  return hash.toUpperCase();
+}
+
+/**
+ * 驗證 CheckMacValue
+ */
+function verifyCheckMacValue(params, hashKey, hashIv) {
+  const receivedMac = params.CheckMacValue;
+  if (!receivedMac) return false;
+  
+  const paramsWithoutMac = { ...params };
+  delete paramsWithoutMac.CheckMacValue;
+  
+  const calculatedMac = generateCheckMacValue(paramsWithoutMac, hashKey, hashIv);
+  return calculatedMac === receivedMac;
+}
+
+/**
+ * 生成超商地圖參數
+ */
+function generateCvsMapParams(merchant, data, callbackUrl) {
+  const tradeNo = generateLogisticsTradeNo();
+  
+  const params = {
+    MerchantID: merchant.ecpay_merchant_id,
+    MerchantTradeNo: tradeNo,
+    LogisticsType: 'CVS',
+    LogisticsSubType: CVS_TYPE_MAP[data.cvs_type] || 'UNIMARTC2C',
+    IsCollection: data.is_collection ? 'Y' : 'N',
+    ServerReplyURL: callbackUrl,
+    ExtraData: data.extra_data || ''
+  };
+  
+  return { params, tradeNo };
+}
+
+/**
+ * 生成建立物流單參數 (C2C 超商取貨)
+ */
+function generateCreateShipmentParams(merchant, data, hashKey, hashIv) {
+  const tradeNo = data.merchant_trade_no || generateLogisticsTradeNo();
+  const subType = CVS_TYPE_MAP[data.cvs_sub_type] || 'UNIMARTC2C';
+  
+  // C2C 必要參數（所有值都要是字串）
+  const params = {
+    MerchantID: String(merchant.ecpay_merchant_id),
+    MerchantTradeNo: String(tradeNo),
+    MerchantTradeDate: dayjs().format('YYYY/MM/DD HH:mm:ss'),
+    LogisticsType: 'CVS',
+    LogisticsSubType: subType,
+    GoodsName: String(data.goods_name || '商品').substring(0, 60),
+    SenderName: String(data.sender_name || '敏捷商店').substring(0, 10),
+    SenderCellPhone: String(data.sender_cellphone || '0912345678'),
+    ReceiverName: String(data.receiver_name).substring(0, 10),
+    ReceiverCellPhone: String(data.receiver_cellphone || data.receiver_phone || ''),
+    ReceiverStoreID: String(data.receiver_store_id),
+    ServerReplyURL: String(data.server_reply_url || ''),
+    IsCollection: data.is_collection ? 'Y' : 'N'
+  };
+  
+  // 若代收貨款
+  if (data.is_collection) {
+    params.CollectionAmount = String(data.collection_amount || data.goods_amount || 0);
   }
-});
+  
+  // Debug: 印出參數（隱藏敏感資訊）
+  console.log('Shipment params (before CheckMac):', JSON.stringify(params, null, 2));
+  console.log('Using HashKey:', hashKey ? hashKey.substring(0, 4) + '***' : 'NULL');
+  console.log('Using HashIV:', hashIv ? hashIv.substring(0, 4) + '***' : 'NULL');
+  
+  // 生成 CheckMacValue
+  params.CheckMacValue = generateCheckMacValue(params, hashKey, hashIv);
+  
+  console.log('Generated CheckMacValue:', params.CheckMacValue);
+  
+  return { params, tradeNo };
+}
 
 /**
- * POST /api/v1/logistics/cvs-map/callback
- * 超商地圖選店回調
+ * 生成查詢物流狀態參數
  */
-router.post('/cvs-map/callback', async (req, res) => {
-  try {
-    console.log('CVS map callback:', req.body);
-    
-    const {
-      MerchantTradeNo,
-      CVSStoreID,
-      CVSStoreName,
-      CVSAddress,
-      CVSTelephone,
-      LogisticsSubType,
-      ExtraData
-    } = req.body;
-    
-    // 更新暫存
-    await supabase
-      .from('gateway_cvs_selections')
-      .update({
-        cvs_store_id: CVSStoreID,
-        cvs_store_name: CVSStoreName,
-        cvs_address: CVSAddress,
-        cvs_telephone: CVSTelephone || null,
-        cvs_sub_type: LogisticsSubType
-      })
-      .eq('temp_trade_no', MerchantTradeNo);
-    
-    // 回傳確認頁面
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(`
+function generateQueryParams(merchant, allPayLogisticsId, hashKey, hashIv) {
+  const params = {
+    MerchantID: String(merchant.ecpay_merchant_id),
+    AllPayLogisticsID: String(allPayLogisticsId),
+    TimeStamp: String(Math.floor(Date.now() / 1000))
+  };
+  
+  params.CheckMacValue = generateCheckMacValue(params, hashKey, hashIv);
+  
+  return params;
+}
+
+/**
+ * 取得 API URL
+ */
+function getApiUrl(type, isStaging = true) {
+  const env = isStaging ? 'staging' : 'production';
+  return ECPAY_LOGISTICS_URL[env][type];
+}
+
+/**
+ * 生成超商地圖表單 HTML
+ */
+function generateMapFormHtml(params, isStaging = true) {
+  const url = getApiUrl('map', isStaging);
+  
+  let formHtml = `
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>門市選擇完成</title>
-  <style>
-    body { font-family: sans-serif; text-align: center; padding: 50px; }
-    .success { color: green; }
-    .store-info { margin: 20px 0; padding: 20px; background: #f5f5f5; border-radius: 8px; }
-  </style>
+  <title>選擇取貨門市</title>
 </head>
 <body>
-  <h1 class="success">✓ 門市選擇完成</h1>
-  <div class="store-info">
-    <p><strong>門市：</strong>${CVSStoreName}</p>
-    <p><strong>地址：</strong>${CVSAddress}</p>
-  </div>
-  <script>
-    if (window.opener) {
-      window.opener.postMessage({
-        type: 'CVS_STORE_SELECTED',
-        data: {
-          tempTradeNo: '${MerchantTradeNo}',
-          storeId: '${CVSStoreID}',
-          storeName: '${CVSStoreName}',
-          address: '${CVSAddress}'
-        }
-      }, '*');
-      setTimeout(() => window.close(), 2000);
-    }
-  </script>
-  <p>此視窗將自動關閉...</p>
+  <form id="ecpay-map-form" method="POST" action="${url}">
+`;
+  
+  Object.entries(params).forEach(([key, value]) => {
+    formHtml += `    <input type="hidden" name="${key}" value="${value}">\n`;
+  });
+  
+  formHtml += `
+  </form>
+  <script>document.getElementById('ecpay-map-form').submit();</script>
 </body>
-</html>`);
-    
-  } catch (error) {
-    console.error('CVS callback error:', error);
-    res.status(500).send('<h1>處理失敗</h1>');
-  }
-});
+</html>`;
+  
+  return formHtml;
+}
 
 /**
- * GET /api/v1/logistics/cvs-selection/:tradeNo
- * 查詢超商選店結果
+ * 解析物流狀態
  */
-router.get('/cvs-selection/:tradeNo', authMiddleware, async (req, res) => {
-  try {
-    const { tradeNo } = req.params;
-    
-    const { data, error } = await supabase
-      .from('gateway_cvs_selections')
-      .select('*')
-      .eq('temp_trade_no', tradeNo)
-      .eq('merchant_id', req.merchant.id)
-      .single();
-    
-    if (error || !data) {
-      return res.status(404).json({ error: 'Selection not found' });
-    }
-    
-    res.json({
-      success: true,
-      selection: {
-        temp_trade_no: data.temp_trade_no,
-        store_id: data.cvs_store_id,
-        store_name: data.cvs_store_name,
-        address: data.cvs_address,
-        telephone: data.cvs_telephone,
-        cvs_type: data.cvs_sub_type,
-        is_used: data.is_used
-      }
-    });
-    
-  } catch (error) {
-    console.error('Get CVS selection error:', error);
-    res.status(500).json({ error: 'Failed to get selection' });
-  }
-});
+function parseLogisticsStatus(rtnCode) {
+  const statusMap = {
+    '300': 'created',
+    '2030': 'shipping',
+    '2063': 'arrived',
+    '2067': 'picked_up',
+    '2074': 'returned',
+    '9000': 'failed'
+  };
+  
+  return statusMap[rtnCode] || 'pending';
+}
 
-/**
- * POST /api/v1/logistics/shipment
- * 建立超商物流單
- */
-router.post('/shipment', authMiddleware, async (req, res) => {
-  try {
-    const {
-      temp_trade_no,        // 選店暫時單號（可選）
-      goods_name,
-      goods_amount = 1,
-      sender_name = '敏捷商店',
-      sender_phone,
-      sender_cellphone,
-      receiver_name,
-      receiver_phone,
-      receiver_cellphone,
-      receiver_email,
-      receiver_store_id,    // 直接指定門市 ID
-      cvs_sub_type,         // UNIMARTC2C, FAMIC2C, HILIFEC2C
-      is_collection = false,
-      collection_amount = 0,
-      order_id,
-      transaction_id
-    } = req.body;
-    
-    const merchant = req.merchant;
-    
-    let storeId = receiver_store_id;
-    let subType = cvs_sub_type;
-    let storeName = null;
-    
-    // 從暫存取得門市資訊
-    if (temp_trade_no && !storeId) {
-      const { data: selection } = await supabase
-        .from('gateway_cvs_selections')
-        .select('*')
-        .eq('temp_trade_no', temp_trade_no)
-        .eq('merchant_id', merchant.id)
-        .eq('is_used', false)
-        .single();
-      
-      if (selection && selection.cvs_store_id) {
-        storeId = selection.cvs_store_id;
-        subType = subType || selection.cvs_sub_type;
-        storeName = selection.cvs_store_name;
-        
-        // 標記已使用
-        await supabase
-          .from('gateway_cvs_selections')
-          .update({ is_used: true })
-          .eq('id', selection.id);
-      }
-    }
-    
-    if (!storeId) {
-      return res.status(400).json({ error: 'receiver_store_id is required' });
-    }
-    if (!subType) {
-      return res.status(400).json({ error: 'cvs_sub_type is required (UNIMARTC2C, FAMIC2C, HILIFEC2C)' });
-    }
-    if (!receiver_name) {
-      return res.status(400).json({ error: 'receiver_name is required' });
-    }
-    
-    // 解密憑證
-    const hashKey = decrypt(merchant.ecpay_hash_key_encrypted);
-    const hashIv = decrypt(merchant.ecpay_hash_iv_encrypted);
-    
-    const gatewayUrl = process.env.GATEWAY_URL || `https://${req.get('host')}`;
-    
-    // 生成物流單參數
-    const { params, tradeNo } = generateCreateShipmentParams(merchant, {
-      goods_name,
-      goods_amount,
-      sender_name,
-      sender_phone,
-      sender_cellphone,
-      receiver_name,
-      receiver_phone,
-      receiver_cellphone: receiver_cellphone || receiver_phone,
-      receiver_email,
-      receiver_store_id: storeId,
-      cvs_sub_type: subType,
-      is_collection,
-      collection_amount,
-      server_reply_url: `${gatewayUrl}/api/v1/logistics/webhook`
-    }, hashKey, hashIv);
-    
-    // 呼叫綠界 API
-    const apiUrl = getApiUrl('create', merchant.is_staging);
-    const formBody = new URLSearchParams(params).toString();
-    
-    console.log('Creating shipment:', { tradeNo, storeId, apiUrl });
-    
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: formBody
-    });
-    
-    const responseText = await response.text();
-    console.log('ECPay response:', responseText);
-    
-    // 解析回應
-    const ecpayResult = {};
-    responseText.split('&').forEach(pair => {
-      const [key, value] = pair.split('=');
-      if (key) ecpayResult[key] = decodeURIComponent(value || '');
-    });
-    
-    // 檢查是否成功
-    if (ecpayResult.RtnCode !== '300' && ecpayResult.RtnCode !== '1') {
-      return res.status(400).json({
-        error: 'ECPay create shipment failed',
-        code: ecpayResult.RtnCode,
-        message: ecpayResult.RtnMsg
-      });
-    }
-    
-    // 儲存到資料庫
-    const { data: shipment, error: insertError } = await supabase
-      .from('gateway_shipments')
-      .insert({
-        merchant_id: merchant.id,
-        transaction_id: transaction_id || null,
-        merchant_trade_no: tradeNo,
-        all_pay_logistics_id: ecpayResult.AllPayLogisticsID || ecpayResult['1|AllPayLogisticsID'],
-        logistics_type: 'CVS',
-        logistics_sub_type: subType,
-        cvs_payment_no: ecpayResult.CVSPaymentNo,
-        cvs_validation_no: ecpayResult.CVSValidationNo,
-        receiver_name,
-        receiver_phone: receiver_phone || receiver_cellphone,
-        receiver_store_id: storeId,
-        receiver_store_name: storeName,
-        sender_name,
-        sender_phone: sender_phone || sender_cellphone,
-        status: 'created',
-        goods_name,
-        goods_amount,
-        cod_amount: is_collection ? collection_amount : 0,
-        order_id: order_id || null,
-        ecpay_response: ecpayResult
-      })
-      .select()
-      .single();
-    
-    if (insertError) throw insertError;
-    
-    res.json({
-      success: true,
-      shipment: {
-        id: shipment.id,
-        merchant_trade_no: tradeNo,
-        all_pay_logistics_id: ecpayResult.AllPayLogisticsID,
-        cvs_payment_no: ecpayResult.CVSPaymentNo,
-        cvs_validation_no: ecpayResult.CVSValidationNo,
-        status: 'created'
-      }
-    });
-    
-  } catch (error) {
-    console.error('Create shipment error:', error);
-    res.status(500).json({ error: 'Failed to create shipment' });
-  }
-});
-
-/**
- * POST /api/v1/logistics/webhook
- * 物流狀態更新回調
- */
-router.post('/webhook', async (req, res) => {
-  try {
-    console.log('Logistics webhook:', req.body);
-    
-    const { MerchantTradeNo, RtnCode, RtnMsg, AllPayLogisticsID } = req.body;
-    
-    // 查詢物流單
-    const { data: shipment, error: queryError } = await supabase
-      .from('gateway_shipments')
-      .select('*, gateway_merchants(*)')
-      .eq('merchant_trade_no', MerchantTradeNo)
-      .single();
-    
-    if (queryError || !shipment) {
-      console.error('Shipment not found:', MerchantTradeNo);
-      return res.send('0|Shipment not found');
-    }
-    
-    // 驗證 CheckMacValue
-    const merchant = shipment.gateway_merchants;
-    const hashKey = decrypt(merchant.ecpay_hash_key_encrypted);
-    const hashIv = decrypt(merchant.ecpay_hash_iv_encrypted);
-    
-    const isValid = verifyCheckMacValue(req.body, hashKey, hashIv);
-    
-    // 記錄 webhook
-    await supabase.from('gateway_webhook_logs').insert({
-      merchant_id: merchant.id,
-      shipment_id: shipment.id,
-      type: 'logistics',
-      source_ip: req.ip,
-      raw_body: JSON.stringify(req.body),
-      check_mac_valid: isValid,
-      processed: true
-    });
-    
-    if (!isValid) {
-      console.error('Invalid CheckMacValue');
-      return res.send('0|CheckMacValue Error');
-    }
-    
-    // 更新狀態
-    const status = parseLogisticsStatus(RtnCode);
-    const updateData = {
-      status,
-      status_message: RtnMsg,
-      updated_at: new Date()
-    };
-    
-    if (status === 'shipping') updateData.shipped_at = new Date();
-    if (status === 'arrived') updateData.arrived_at = new Date();
-    if (status === 'picked_up') updateData.picked_up_at = new Date();
-    
-    await supabase
-      .from('gateway_shipments')
-      .update(updateData)
-      .eq('id', shipment.id);
-    
-    console.log(`Shipment ${MerchantTradeNo} → ${status}`);
-    
-    res.send('1|OK');
-    
-  } catch (error) {
-    console.error('Logistics webhook error:', error);
-    res.send('0|Error');
-  }
-});
-
-/**
- * GET /api/v1/logistics/shipment/:id
- * 查詢物流單
- */
-router.get('/shipment/:id', authMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    const { data: shipment, error } = await supabase
-      .from('gateway_shipments')
-      .select('*')
-      .eq('id', id)
-      .eq('merchant_id', req.merchant.id)
-      .single();
-    
-    if (error || !shipment) {
-      return res.status(404).json({ error: 'Shipment not found' });
-    }
-    
-    res.json({ success: true, shipment });
-    
-  } catch (error) {
-    console.error('Get shipment error:', error);
-    res.status(500).json({ error: 'Failed to get shipment' });
-  }
-});
-
-/**
- * GET /api/v1/logistics/shipments
- * 列出物流單
- */
-router.get('/shipments', authMiddleware, async (req, res) => {
-  try {
-    const { status, order_id, limit = 20, offset = 0 } = req.query;
-    
-    let query = supabase
-      .from('gateway_shipments')
-      .select('*', { count: 'exact' })
-      .eq('merchant_id', req.merchant.id)
-      .order('created_at', { ascending: false })
-      .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
-    
-    if (status) query = query.eq('status', status);
-    if (order_id) query = query.eq('order_id', order_id);
-    
-    const { data: shipments, count, error } = await query;
-    
-    if (error) throw error;
-    
-    res.json({ success: true, shipments, total: count });
-    
-  } catch (error) {
-    console.error('List shipments error:', error);
-    res.status(500).json({ error: 'Failed to list shipments' });
-  }
-});
-
-module.exports = router;
+module.exports = {
+  generateLogisticsTradeNo,
+  generateCheckMacValue,
+  verifyCheckMacValue,
+  generateCvsMapParams,
+  generateCreateShipmentParams,
+  generateQueryParams,
+  getApiUrl,
+  generateMapFormHtml,
+  parseLogisticsStatus,
+  CVS_TYPE_MAP
+};
