@@ -1,5 +1,6 @@
 /**
  * ECPay 物流服務 - 超商取貨
+ * ⚠️ 重要：物流 API 用 MD5，金流 API 用 SHA256
  */
 const crypto = require('crypto');
 const dayjs = require('dayjs');
@@ -20,9 +21,9 @@ const ECPAY_LOGISTICS_URL = {
 
 // 超商類型對應
 const CVS_TYPE_MAP = {
-  'FAMI': 'FAMIC2C',      // 全家
-  'UNIMART': 'UNIMARTC2C', // 7-11
-  'HILIFE': 'HILIFEC2C',   // 萊爾富
+  'FAMI': 'FAMIC2C',
+  'UNIMART': 'UNIMARTC2C',
+  'HILIFE': 'HILIFEC2C',
   'FAMIC2C': 'FAMIC2C',
   'UNIMARTC2C': 'UNIMARTC2C',
   'HILIFEC2C': 'HILIFEC2C'
@@ -38,10 +39,11 @@ function generateLogisticsTradeNo() {
 }
 
 /**
- * 生成 CheckMacValue (SHA256)
+ * 生成 CheckMacValue
+ * ⚠️ 物流用 MD5，金流用 SHA256
  */
-function generateCheckMacValue(params, hashKey, hashIv) {
-  // 按照 key 排序
+function generateCheckMacValue(params, hashKey, hashIv, algorithm = 'md5') {
+  // 按照 key 排序（不分大小寫）
   const sortedKeys = Object.keys(params).sort((a, b) => 
     a.toLowerCase().localeCompare(b.toLowerCase())
   );
@@ -53,8 +55,16 @@ function generateCheckMacValue(params, hashKey, hashIv) {
   });
   paramStr += `&HashIV=${hashIv}`;
   
-  // URL encode (大寫)
-  paramStr = encodeURIComponent(paramStr).toLowerCase();
+  // Debug log
+  console.log('=== CheckMacValue Debug ===');
+  console.log('Algorithm:', algorithm);
+  console.log('Before encode:', paramStr.substring(0, 200) + '...');
+  
+  // URL encode
+  paramStr = encodeURIComponent(paramStr);
+  
+  // 轉小寫
+  paramStr = paramStr.toLowerCase();
   
   // 綠界特殊字元處理
   paramStr = paramStr
@@ -67,23 +77,29 @@ function generateCheckMacValue(params, hashKey, hashIv) {
     .replace(/%29/g, ')')
     .replace(/%20/g, '+');
   
-  // SHA256 雜湊
-  const hash = crypto.createHash('sha256').update(paramStr).digest('hex');
-  return hash.toUpperCase();
+  console.log('After encode:', paramStr.substring(0, 200) + '...');
+  
+  // 雜湊
+  const hash = crypto.createHash(algorithm).update(paramStr).digest('hex');
+  const result = hash.toUpperCase();
+  
+  console.log('CheckMacValue:', result);
+  console.log('=== End Debug ===');
+  
+  return result;
 }
 
 /**
  * 驗證 CheckMacValue
  */
-function verifyCheckMacValue(params, hashKey, hashIv) {
+function verifyCheckMacValue(params, hashKey, hashIv, algorithm = 'md5') {
   const receivedMac = params.CheckMacValue;
   if (!receivedMac) return false;
   
-  // 移除 CheckMacValue 重新計算
   const paramsWithoutMac = { ...params };
   delete paramsWithoutMac.CheckMacValue;
   
-  const calculatedMac = generateCheckMacValue(paramsWithoutMac, hashKey, hashIv);
+  const calculatedMac = generateCheckMacValue(paramsWithoutMac, hashKey, hashIv, algorithm);
   return calculatedMac === receivedMac;
 }
 
@@ -94,50 +110,51 @@ function generateCvsMapParams(merchant, data, callbackUrl) {
   const tradeNo = generateLogisticsTradeNo();
   
   const params = {
-    MerchantID: merchant.ecpay_merchant_id,
-    MerchantTradeNo: tradeNo,
+    MerchantID: String(merchant.ecpay_merchant_id),
+    MerchantTradeNo: String(tradeNo),
     LogisticsType: 'CVS',
     LogisticsSubType: CVS_TYPE_MAP[data.cvs_type] || 'UNIMARTC2C',
-    IsCollection: data.is_collection ? 'Y' : 'N', // 是否代收貨款
-    ServerReplyURL: callbackUrl,
-    ExtraData: data.extra_data || ''
+    IsCollection: data.is_collection ? 'Y' : 'N',
+    ServerReplyURL: String(callbackUrl),
+    ExtraData: String(data.extra_data || '')
   };
   
-  // 物流地圖不需要 CheckMacValue
   return { params, tradeNo };
 }
 
 /**
  * 生成建立物流單參數
+ * ⚠️ 所有值必須是字串！
  */
 function generateCreateShipmentParams(merchant, data, hashKey, hashIv) {
   const tradeNo = data.merchant_trade_no || generateLogisticsTradeNo();
   
+  // ⚠️ 重要：ECPay 所有參數必須是字串
   const params = {
-    MerchantID: merchant.ecpay_merchant_id,
-    MerchantTradeNo: tradeNo,
+    MerchantID: String(merchant.ecpay_merchant_id),
+    MerchantTradeNo: String(tradeNo),
     MerchantTradeDate: dayjs().format('YYYY/MM/DD HH:mm:ss'),
     LogisticsType: 'CVS',
     LogisticsSubType: CVS_TYPE_MAP[data.cvs_sub_type] || 'UNIMARTC2C',
-    GoodsAmount: data.goods_amount || 1,
-    GoodsName: (data.goods_name || '商品').substring(0, 60),
-    SenderName: (data.sender_name || '敏捷商店').substring(0, 10),
-    SenderPhone: data.sender_phone || '',
-    SenderCellPhone: data.sender_cellphone || '0912345678',
-    ReceiverName: data.receiver_name.substring(0, 10),
-    ReceiverPhone: data.receiver_phone || '',
-    ReceiverCellPhone: data.receiver_cellphone || data.receiver_phone,
-    ReceiverEmail: data.receiver_email || '',
-    ReceiverStoreID: data.receiver_store_id,
-    TradeDesc: (data.trade_desc || '網路購物').substring(0, 200),
-    ServerReplyURL: data.server_reply_url,
+    GoodsAmount: String(data.goods_amount || 1),
+    GoodsName: String(data.goods_name || '商品').substring(0, 60),
+    SenderName: String(data.sender_name || '測試寄件').substring(0, 10),
+    SenderCellPhone: String(data.sender_cellphone || '0912345678'),
+    ReceiverName: String(data.receiver_name).substring(0, 10),
+    ReceiverCellPhone: String(data.receiver_cellphone || data.receiver_phone),
+    ReceiverStoreID: String(data.receiver_store_id),
+    TradeDesc: String(data.trade_desc || '網路購物').substring(0, 200),
+    ServerReplyURL: String(data.server_reply_url || 'https://example.com/webhook'),
     IsCollection: data.is_collection ? 'Y' : 'N',
-    CollectionAmount: data.is_collection ? (data.collection_amount || data.goods_amount) : 0,
-    Platform: ''
+    CollectionAmount: String(data.is_collection ? (data.collection_amount || data.goods_amount || 0) : 0)
   };
   
-  // 生成 CheckMacValue
-  params.CheckMacValue = generateCheckMacValue(params, hashKey, hashIv);
+  // Debug: 輸出參數
+  console.log('=== Shipment Params ===');
+  console.log(JSON.stringify(params, null, 2));
+  
+  // 生成 CheckMacValue（物流用 MD5）
+  params.CheckMacValue = generateCheckMacValue(params, hashKey, hashIv, 'md5');
   
   return { params, tradeNo };
 }
@@ -147,12 +164,12 @@ function generateCreateShipmentParams(merchant, data, hashKey, hashIv) {
  */
 function generateQueryParams(merchant, allPayLogisticsId, hashKey, hashIv) {
   const params = {
-    MerchantID: merchant.ecpay_merchant_id,
-    AllPayLogisticsID: allPayLogisticsId,
-    TimeStamp: Math.floor(Date.now() / 1000).toString()
+    MerchantID: String(merchant.ecpay_merchant_id),
+    AllPayLogisticsID: String(allPayLogisticsId),
+    TimeStamp: String(Math.floor(Date.now() / 1000))
   };
   
-  params.CheckMacValue = generateCheckMacValue(params, hashKey, hashIv);
+  params.CheckMacValue = generateCheckMacValue(params, hashKey, hashIv, 'md5');
   
   return params;
 }
@@ -200,12 +217,12 @@ function generateMapFormHtml(params, isStaging = true) {
  */
 function parseLogisticsStatus(rtnCode) {
   const statusMap = {
-    '300': 'created',      // 訂單已建立
-    '2030': 'shipping',    // 配送中
-    '2063': 'arrived',     // 到店
-    '2067': 'picked_up',   // 取貨完成
-    '2074': 'returned',    // 退貨
-    '9000': 'failed'       // 失敗
+    '300': 'created',
+    '2030': 'shipping',
+    '2063': 'arrived',
+    '2067': 'picked_up',
+    '2074': 'returned',
+    '9000': 'failed'
   };
   
   return statusMap[rtnCode] || 'pending';
