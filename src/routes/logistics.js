@@ -22,39 +22,42 @@ const {
  */
 router.post('/cvs-map', authMiddleware, async (req, res) => {
   try {
-    const { cvs_type = 'UNIMART', is_collection = false, extra_data = '' } = req.body;
+    const { cvs_type = 'UNIMART', is_collection = false, extra_data = '', return_url = '' } = req.body;
     const merchant = req.merchant;
-    
+
     const gatewayUrl = process.env.GATEWAY_URL || `https://${req.get('host')}`;
     const callbackUrl = `${gatewayUrl}/api/v1/logistics/cvs-map/callback`;
-    
+
+    // 將 return_url 存入 extra_data（JSON 格式）
+    const storedExtraData = JSON.stringify({ return_url, original: extra_data });
+
     const { params, tradeNo } = generateCvsMapParams(merchant, {
       cvs_type,
       is_collection,
       extra_data
     }, callbackUrl);
-    
+
     const { error: insertError } = await supabase
       .from('gateway_cvs_selections')
       .insert({
         merchant_id: merchant.id,
         temp_trade_no: tradeNo,
         cvs_sub_type: cvs_type,
-        extra_data,
+        extra_data: storedExtraData,
         expires_at: new Date(Date.now() + 30 * 60 * 1000)
       });
-    
+
     if (insertError) throw insertError;
-    
+
     const mapUrl = `${gatewayUrl}/api/v1/logistics/cvs-map/${tradeNo}`;
-    
+
     res.json({
       success: true,
       temp_trade_no: tradeNo,
       map_url: mapUrl,
       expires_in: 1800
     });
-    
+
   } catch (error) {
     console.error('CVS map error:', error);
     res.status(500).json({ error: 'Failed to generate CVS map URL' });
@@ -112,7 +115,7 @@ router.get('/cvs-map/:tradeNo', async (req, res) => {
 router.post('/cvs-map/callback', async (req, res) => {
   try {
     console.log('CVS map callback:', req.body);
-    
+
     const {
       MerchantTradeNo,
       CVSStoreID,
@@ -121,7 +124,8 @@ router.post('/cvs-map/callback', async (req, res) => {
       CVSTelephone,
       LogisticsSubType
     } = req.body;
-    
+
+    // 更新門市資料
     await supabase
       .from('gateway_cvs_selections')
       .update({
@@ -132,7 +136,24 @@ router.post('/cvs-map/callback', async (req, res) => {
         cvs_sub_type: LogisticsSubType
       })
       .eq('temp_trade_no', MerchantTradeNo);
-    
+
+    // 取得 extra_data 以解析 return_url
+    const { data: selection } = await supabase
+      .from('gateway_cvs_selections')
+      .select('extra_data')
+      .eq('temp_trade_no', MerchantTradeNo)
+      .single();
+
+    let returnUrl = '';
+    if (selection?.extra_data) {
+      try {
+        const parsed = JSON.parse(selection.extra_data);
+        returnUrl = parsed.return_url || '';
+      } catch (e) {
+        // extra_data 不是 JSON，忽略
+      }
+    }
+
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(`
 <!DOCTYPE html>
@@ -164,12 +185,18 @@ router.post('/cvs-map/callback', async (req, res) => {
         }
       }, '*');
       setTimeout(() => window.close(), 2000);
+    } else {
+      const returnUrl = '${returnUrl}';
+      if (returnUrl) {
+        document.querySelector('p:last-child').textContent = '即將返回結帳頁...';
+        setTimeout(() => { window.location.href = returnUrl; }, 2000);
+      }
     }
   </script>
   <p>此視窗將自動關閉...</p>
 </body>
 </html>`);
-    
+
   } catch (error) {
     console.error('CVS callback error:', error);
     res.status(500).send('<h1>處理失敗</h1>');
