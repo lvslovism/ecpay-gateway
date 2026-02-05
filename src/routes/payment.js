@@ -131,7 +131,7 @@ router.get('/checkout/:merchantTradeNo', async (req, res) => {
       itemName: transaction.item_name,
       returnUrl: `${gatewayUrl}/api/v1/payment/webhook`, // ECPay 伺服器回呼
       clientBackUrl: merchant.success_url, // 用戶點「返回商店」
-      orderResultUrl: transaction.return_url || merchant.success_url // 付款完成跳轉
+      orderResultUrl: `${gatewayUrl}/api/v1/payment/result` // 付款完成跳轉（經 Gateway 轉換為 GET）
     });
 
     // 計算 CheckMacValue
@@ -146,6 +146,53 @@ router.get('/checkout/:merchantTradeNo', async (req, res) => {
   } catch (err) {
     console.error('Checkout page error:', err);
     res.status(500).send('Internal server error');
+  }
+});
+
+/**
+ * POST /api/v1/payment/result
+ * ECPay 付款完成後跳轉（OrderResultURL）
+ * 將 POST 轉換為 GET redirect，讓前端能讀取參數
+ */
+router.post('/result', async (req, res) => {
+  try {
+    const params = req.body;
+    const merchantTradeNo = params.MerchantTradeNo;
+
+    console.log('Payment result redirect:', merchantTradeNo);
+
+    // 查詢交易取得 return_url
+    const { data: transaction, error } = await supabase
+      .from('gateway_transactions')
+      .select('return_url, gateway_merchants(success_url)')
+      .eq('merchant_trade_no', merchantTradeNo)
+      .single();
+
+    // 決定跳轉目標
+    let redirectUrl = transaction?.return_url
+      || transaction?.gateway_merchants?.success_url
+      || '/';
+
+    // 組合 query string（只傳必要參數）
+    const queryParams = new URLSearchParams({
+      MerchantTradeNo: params.MerchantTradeNo || '',
+      RtnCode: params.RtnCode || '',
+      RtnMsg: params.RtnMsg || '',
+      TradeNo: params.TradeNo || '',
+      TradeAmt: params.TradeAmt || '',
+      PaymentDate: params.PaymentDate || '',
+      PaymentType: params.PaymentType || ''
+    });
+
+    // 302 redirect
+    const finalUrl = `${redirectUrl}?${queryParams.toString()}`;
+    console.log('Redirecting to:', finalUrl);
+
+    res.redirect(302, finalUrl);
+
+  } catch (err) {
+    console.error('Payment result redirect error:', err);
+    res.status(500).send('Redirect failed');
   }
 });
 
