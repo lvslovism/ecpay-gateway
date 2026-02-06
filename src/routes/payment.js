@@ -281,6 +281,52 @@ router.post('/webhook', async (req, res) => {
       .eq('transaction_id', transaction.id)
       .eq('type', 'payment');
 
+    // 付款成功：呼叫 Medusa API 完成訂單
+    if (isSuccess && transaction.order_id) {
+      try {
+        // order_id 格式是 "cart_{cart_id}"，需要提取 cart_id
+        const cartId = transaction.order_id.replace('cart_', '');
+
+        const medusaUrl = merchant.medusa_backend_url || process.env.MEDUSA_BACKEND_URL;
+        const medusaKey = merchant.medusa_publishable_key || process.env.MEDUSA_PUBLISHABLE_KEY;
+
+        if (medusaUrl && medusaKey && cartId) {
+          console.log('Completing Medusa cart:', cartId);
+
+          const medusaResponse = await fetch(`${medusaUrl}/store/carts/${cartId}/complete`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-publishable-api-key': medusaKey
+            }
+          });
+
+          const medusaResult = await medusaResponse.json();
+          console.log('Medusa complete cart result:', medusaResult);
+
+          if (medusaResult.type === 'order') {
+            // 訂單建立成功，記錄 Medusa order_id
+            await supabase
+              .from('gateway_transactions')
+              .update({
+                medusa_order_id: medusaResult.order?.id,
+                order_completed_at: new Date().toISOString()
+              })
+              .eq('id', transaction.id);
+
+            console.log('Medusa order created:', medusaResult.order?.id);
+          } else {
+            console.error('Medusa cart completion failed:', medusaResult.error || medusaResult);
+          }
+        } else {
+          console.log('Medusa integration not configured, skipping cart completion');
+        }
+      } catch (medusaErr) {
+        console.error('Failed to complete Medusa cart:', medusaErr);
+        // 不影響 ECPay webhook 回應，繼續處理
+      }
+    }
+
     // 通知商家（如果有設定 webhook_url）
     if (merchant.webhook_url) {
       try {
