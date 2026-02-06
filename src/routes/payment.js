@@ -284,8 +284,11 @@ router.post('/webhook', async (req, res) => {
     // 付款成功：呼叫 Medusa API 完成訂單
     if (isSuccess && transaction.order_id) {
       try {
-        // order_id 格式是 "cart_{id}" - Medusa v2 使用完整的 cart ID
+        // order_id 在 DB 中已經是完整的 cart ID (例如 cart_01KGRW...)
+        // 直接使用，不做任何處理
         const cartId = transaction.order_id;
+
+        console.log('Raw order_id from DB:', transaction.order_id);
 
         const medusaUrl = merchant.medusa_backend_url || process.env.MEDUSA_BACKEND_URL;
         const medusaKey = merchant.medusa_publishable_key || process.env.MEDUSA_PUBLISHABLE_KEY;
