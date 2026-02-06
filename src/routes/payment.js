@@ -13,6 +13,113 @@ const {
 const { authMiddleware } = require('../middleware/auth');
 
 /**
+ * 取得 Medusa Admin Token
+ * @param {string} medusaUrl - Medusa backend URL
+ * @returns {Promise<string|null>} - Admin token or null if failed
+ */
+async function getMedusaAdminToken(medusaUrl) {
+  const email = process.env.MEDUSA_ADMIN_EMAIL;
+  const password = process.env.MEDUSA_ADMIN_PASSWORD;
+
+  if (!email || !password) {
+    console.log('[Capture] Missing MEDUSA_ADMIN_EMAIL or MEDUSA_ADMIN_PASSWORD');
+    return null;
+  }
+
+  try {
+    const response = await fetch(`${medusaUrl}/auth/user/emailpass`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+
+    if (!response.ok) {
+      console.error('[Capture] Failed to get admin token:', response.status);
+      return null;
+    }
+
+    const data = await response.json();
+    return data.token || null;
+  } catch (err) {
+    console.error('[Capture] Error getting admin token:', err.message);
+    return null;
+  }
+}
+
+/**
+ * 自動 Capture Payment
+ * @param {string} medusaUrl - Medusa backend URL
+ * @param {string} orderId - Medusa order ID
+ */
+async function capturePayment(medusaUrl, orderId) {
+  console.log('[Capture] Starting payment capture for order:', orderId);
+
+  // Step 1: Get admin token
+  const token = await getMedusaAdminToken(medusaUrl);
+  if (!token) {
+    console.warn('[Capture] Skipping capture - no admin token');
+    return { success: false, reason: 'no_token' };
+  }
+
+  try {
+    // Step 2: Query order to get payment_id
+    console.log('[Capture] Fetching order payment info...');
+    const orderResponse = await fetch(
+      `${medusaUrl}/admin/orders/${orderId}?fields=+payment_collections.payments.*`,
+      {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        }
+      }
+    );
+
+    if (!orderResponse.ok) {
+      console.error('[Capture] Failed to fetch order:', orderResponse.status);
+      return { success: false, reason: 'fetch_order_failed' };
+    }
+
+    const orderData = await orderResponse.json();
+    const paymentId = orderData.order?.payment_collections?.[0]?.payments?.[0]?.id;
+
+    if (!paymentId) {
+      console.warn('[Capture] No payment found in order');
+      return { success: false, reason: 'no_payment_found' };
+    }
+
+    console.log('[Capture] Found payment:', paymentId);
+
+    // Step 3: Capture payment
+    console.log('[Capture] Capturing payment...');
+    const captureResponse = await fetch(
+      `${medusaUrl}/admin/payments/${paymentId}/capture`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        }
+      }
+    );
+
+    if (!captureResponse.ok) {
+      const errorText = await captureResponse.text();
+      console.error('[Capture] Failed to capture payment:', captureResponse.status, errorText.substring(0, 200));
+      return { success: false, reason: 'capture_failed', status: captureResponse.status };
+    }
+
+    const captureData = await captureResponse.json();
+    console.log('[Capture] Payment captured successfully:', paymentId);
+    return { success: true, paymentId, capturedAmount: captureData.payment?.captured_amount };
+
+  } catch (err) {
+    console.error('[Capture] Error during capture:', err.message);
+    return { success: false, reason: 'exception', error: err.message };
+  }
+}
+
+/**
  * POST /api/v1/payment/checkout
  * 建立結帳交易，回傳 checkout_url
  */
@@ -326,16 +433,40 @@ router.post('/webhook', async (req, res) => {
           console.log('Medusa complete cart result:', medusaResult);
 
           if (medusaResult.type === 'order') {
+            const medusaOrderId = medusaResult.order?.id;
+
             // 訂單建立成功，記錄 Medusa order_id
             await supabase
               .from('gateway_transactions')
               .update({
-                medusa_order_id: medusaResult.order?.id,
+                medusa_order_id: medusaOrderId,
                 order_completed_at: new Date().toISOString()
               })
               .eq('id', transaction.id);
 
-            console.log('Medusa order created:', medusaResult.order?.id);
+            console.log('Medusa order created:', medusaOrderId);
+
+            // 自動 Capture Payment（不影響 webhook 回應）
+            if (medusaOrderId) {
+              try {
+                const captureResult = await capturePayment(medusaUrl, medusaOrderId);
+                if (captureResult.success) {
+                  console.log('[Webhook] Payment captured successfully for order:', medusaOrderId);
+                  // 更新交易狀態為 captured
+                  await supabase
+                    .from('gateway_transactions')
+                    .update({
+                      status: 'captured',
+                      captured_at: new Date().toISOString()
+                    })
+                    .eq('id', transaction.id);
+                } else {
+                  console.warn('[Webhook] Payment capture skipped or failed:', captureResult.reason);
+                }
+              } catch (captureErr) {
+                console.error('[Webhook] Payment capture error (non-blocking):', captureErr.message);
+              }
+            }
           } else {
             console.error('Medusa cart completion failed:', medusaResult.error || medusaResult);
           }
