@@ -284,11 +284,13 @@ router.post('/webhook', async (req, res) => {
     // 付款成功：呼叫 Medusa API 完成訂單
     if (isSuccess && transaction.order_id) {
       try {
-        // order_id 格式是 "cart_{cart_id}"，需要提取 cart_id
-        const cartId = transaction.order_id.replace('cart_', '');
+        // order_id 格式是 "cart_{id}" - Medusa v2 使用完整的 cart ID
+        const cartId = transaction.order_id;
 
         const medusaUrl = merchant.medusa_backend_url || process.env.MEDUSA_BACKEND_URL;
         const medusaKey = merchant.medusa_publishable_key || process.env.MEDUSA_PUBLISHABLE_KEY;
+
+        console.log('Medusa config:', { medusaUrl, hasKey: !!medusaKey, cartId });
 
         if (medusaUrl && medusaKey && cartId) {
           console.log('Completing Medusa cart:', cartId);
@@ -301,7 +303,20 @@ router.post('/webhook', async (req, res) => {
             }
           });
 
-          const medusaResult = await medusaResponse.json();
+          // Log response status for debugging
+          console.log('Medusa response status:', medusaResponse.status);
+
+          const responseText = await medusaResponse.text();
+          console.log('Medusa response body:', responseText.substring(0, 500));
+
+          let medusaResult;
+          try {
+            medusaResult = JSON.parse(responseText);
+          } catch (parseErr) {
+            console.error('Failed to parse Medusa response as JSON');
+            throw new Error(`Non-JSON response from Medusa: ${responseText.substring(0, 200)}`);
+          }
+
           console.log('Medusa complete cart result:', medusaResult);
 
           if (medusaResult.type === 'order') {
