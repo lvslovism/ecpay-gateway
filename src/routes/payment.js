@@ -484,7 +484,10 @@ router.post('/webhook', async (req, res) => {
       try {
         await fetch(merchant.webhook_url, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-webhook-secret': process.env.ORDER_WEBHOOK_SECRET || ''
+          },
           body: JSON.stringify({
             event: 'payment.completed',
             transaction_id: transaction.id,
