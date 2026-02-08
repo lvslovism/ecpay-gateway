@@ -268,10 +268,10 @@ router.post('/result', async (req, res) => {
 
     console.log('Payment result redirect:', merchantTradeNo);
 
-    // 查詢交易取得 return_url
+    // 查詢交易取得 return_url, metadata, order_id
     const { data: transaction, error } = await supabase
       .from('gateway_transactions')
-      .select('return_url, gateway_merchants(success_url)')
+      .select('return_url, order_id, metadata, gateway_merchants(success_url)')
       .eq('merchant_trade_no', merchantTradeNo)
       .single();
 
@@ -279,6 +279,9 @@ router.post('/result', async (req, res) => {
     let redirectUrl = transaction?.return_url
       || transaction?.gateway_merchants?.success_url
       || '/';
+
+    // 從 transaction 取 cart_id
+    const cartId = transaction?.metadata?.cart_id || transaction?.order_id || '';
 
     // 組合 query string（只傳必要參數）
     const queryParams = new URLSearchParams({
@@ -288,7 +291,8 @@ router.post('/result', async (req, res) => {
       TradeNo: params.TradeNo || '',
       TradeAmt: params.TradeAmt || '',
       PaymentDate: params.PaymentDate || '',
-      PaymentType: params.PaymentType || ''
+      PaymentType: params.PaymentType || '',
+      cart_id: cartId
     });
 
     // 302 redirect
