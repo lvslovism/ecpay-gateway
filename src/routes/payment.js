@@ -130,12 +130,16 @@ router.post('/checkout', authMiddleware, async (req, res) => {
       amount,
       item_name,
       order_id,
+      cart_id,  // 也接受 cart_id（LIFF checkout 用這個）
       customer_email,
       customer_name,
       customer_phone,
       return_url, // 付款後客戶端跳轉
       metadata = {}
     } = req.body;
+
+    // cart_id 和 order_id 都接受，優先用 order_id（向後相容）
+    const effectiveOrderId = order_id || cart_id || null;
 
     // 驗證必填
     if (!amount || !item_name) {
@@ -158,7 +162,7 @@ router.post('/checkout', authMiddleware, async (req, res) => {
         merchant_trade_no: merchantTradeNo,
         amount: Math.round(amount), // 綠界只接受整數
         item_name,
-        order_id,
+        order_id: effectiveOrderId,  // 用 effectiveOrderId（支援 cart_id）
         customer_email,
         customer_name,
         customer_phone,
@@ -393,12 +397,14 @@ router.post('/webhook', async (req, res) => {
       .eq('type', 'payment');
 
     // 付款成功：呼叫 Medusa API 完成訂單
-    if (isSuccess && transaction.order_id) {
+    // 從 order_id 或 metadata.cart_id 取得 cart_id（fallback）
+    let cartId = transaction.order_id || transaction.metadata?.cart_id || null;
+
+    if (isSuccess && cartId) {
       try {
-        console.log('Raw order_id from DB:', transaction.order_id);
+        console.log('Raw cart_id:', cartId, '(from order_id:', transaction.order_id, ', metadata.cart_id:', transaction.metadata?.cart_id, ')');
 
         // 修正重複 prefix 問題：cart_cart_xxx → cart_xxx
-        let cartId = transaction.order_id;
         if (cartId.startsWith('cart_cart_')) {
           cartId = cartId.replace('cart_cart_', 'cart_');
           console.log('Fixed duplicate prefix, cartId:', cartId);
