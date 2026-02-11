@@ -529,91 +529,90 @@ router.get('/shipments', authMiddleware, async (req, res) => {
 
 /**
  * GET /api/v1/logistics/shipment/:id/print
- * 生成自動提交到 ECPay 列印 API 的表單頁面
+ * 列印託運單 - 生成自動 POST 到 ECPay 的 HTML 表單
  */
 router.get('/shipment/:id/print', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const merchant = req.merchant;
 
-    // 查詢物流單
+    // 查物流單 + 商家資訊
     const { data: shipment, error } = await supabase
       .from('gateway_shipments')
-      .select('*')
+      .select('*, gateway_merchants(*)')
       .eq('id', id)
-      .eq('merchant_id', merchant.id)
+      .eq('merchant_id', req.merchant.id)
       .single();
 
     if (error || !shipment) {
-      return res.status(404).json({ error: 'Shipment not found' });
+      return res.status(404).send('<h1>找不到物流單</h1>');
     }
 
-    // 解密憑證
+    if (!shipment.all_pay_logistics_id || !shipment.cvs_payment_no) {
+      return res.status(400).send('<h1>物流單資訊不完整，無法列印</h1>');
+    }
+
+    const merchant = shipment.gateway_merchants;
     const hashKey = decrypt(merchant.ecpay_hash_key_encrypted);
     const hashIv = decrypt(merchant.ecpay_hash_iv_encrypted);
 
-    // 根據 logistics_sub_type 決定列印 URL
-    const subType = shipment.logistics_sub_type;
-    const isStaging = merchant.is_staging;
-
+    // 根據超商類型決定列印 URL
     const printUrls = {
-      UNIMARTC2C: isStaging
-        ? 'https://logistics-stage.ecpay.com.tw/Express/PrintUniMartC2COrderInfo'
-        : 'https://logistics.ecpay.com.tw/Express/PrintUniMartC2COrderInfo',
-      FAMIC2C: isStaging
-        ? 'https://logistics-stage.ecpay.com.tw/Express/PrintFAMIC2COrderInfo'
-        : 'https://logistics.ecpay.com.tw/Express/PrintFAMIC2COrderInfo',
-      HILIFEC2C: isStaging
-        ? 'https://logistics-stage.ecpay.com.tw/Express/PrintHILIFEC2COrderInfo'
-        : 'https://logistics.ecpay.com.tw/Express/PrintHILIFEC2COrderInfo'
+      UNIMARTC2C: {
+        staging: 'https://logistics-stage.ecpay.com.tw/Express/PrintUniMartC2COrderInfo',
+        production: 'https://logistics.ecpay.com.tw/Express/PrintUniMartC2COrderInfo'
+      },
+      FAMIC2C: {
+        staging: 'https://logistics-stage.ecpay.com.tw/Express/PrintFAMIC2COrderInfo',
+        production: 'https://logistics.ecpay.com.tw/Express/PrintFAMIC2COrderInfo'
+      },
+      HILIFEC2C: {
+        staging: 'https://logistics-stage.ecpay.com.tw/Express/PrintHILIFEC2COrderInfo',
+        production: 'https://logistics.ecpay.com.tw/Express/PrintHILIFEC2COrderInfo'
+      }
     };
 
-    const printUrl = printUrls[subType];
-    if (!printUrl) {
-      return res.status(400).json({ error: `Unsupported logistics sub type: ${subType}` });
+    const subType = shipment.logistics_sub_type;
+    const urlConfig = printUrls[subType];
+    if (!urlConfig) {
+      return res.status(400).send('<h1>不支援的物流類型：' + subType + '</h1>');
     }
 
-    // 組裝參數（全部轉 String）
+    const env = merchant.is_staging ? 'staging' : 'production';
+    const printUrl = urlConfig[env];
+
+    // 組裝參數
     const params = {
       MerchantID: String(merchant.ecpay_merchant_id),
       AllPayLogisticsID: String(shipment.all_pay_logistics_id),
-      CVSPaymentNo: String(shipment.cvs_payment_no || ''),
+      CVSPaymentNo: String(shipment.cvs_payment_no),
       PlatformID: ''
     };
 
-    // UNIMARTC2C 需要 CVSValidationNo
+    // 7-11 需要額外的 CVSValidationNo
     if (subType === 'UNIMARTC2C') {
       params.CVSValidationNo = String(shipment.cvs_validation_no || '');
     }
 
-    // 計算 CheckMacValue（物流用 MD5）
-    const checkMacValue = generateCheckMacValue(params, hashKey, hashIv, 'md5');
-
-    // 生成 hidden inputs
-    const hiddenInputs = Object.entries(params)
-      .map(([key, value]) => `<input type="hidden" name="${key}" value="${value}">`)
-      .join('\n      ');
+    // 計算 CheckMacValue (物流用 MD5)
+    params.CheckMacValue = generateCheckMacValue(params, hashKey, hashIv, 'md5');
 
     // 生成自動提交表單 HTML
+    let formInputs = '';
+    Object.entries(params).forEach(([key, value]) => {
+      formInputs += `    <input type="hidden" name="${key}" value="${value}">\n`;
+    });
+
     const html = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>列印物流單</title>
-  <style>
-    body { font-family: sans-serif; text-align: center; padding: 50px; background: #f5f5f5; }
-    .loading { color: #666; }
-  </style>
+  <title>列印託運單</title>
 </head>
 <body>
-  <p class="loading">正在開啟列印頁面...</p>
-  <form id="printForm" method="POST" action="${printUrl}">
-      ${hiddenInputs}
-      <input type="hidden" name="CheckMacValue" value="${checkMacValue}">
-  </form>
-  <script>
-    document.getElementById('printForm').submit();
-  </script>
+  <p>正在導向綠界列印頁面...</p>
+  <form id="print-form" method="POST" action="${printUrl}">
+${formInputs}  </form>
+  <script>document.getElementById("print-form").submit();</script>
 </body>
 </html>`;
 
@@ -621,8 +620,8 @@ router.get('/shipment/:id/print', authMiddleware, async (req, res) => {
     res.send(html);
 
   } catch (error) {
-    console.error('Print shipment error:', error);
-    res.status(500).json({ error: 'Failed to generate print page' });
+    console.error('Print shipment label error:', error);
+    res.status(500).send('<h1>列印託運單失敗</h1>');
   }
 });
 
