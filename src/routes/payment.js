@@ -336,6 +336,24 @@ router.post('/webhook', async (req, res) => {
 
     const merchant = transaction.gateway_merchants;
 
+    // ★ 冪等檢查：如果這筆交易已經處理過，直接回 1|OK
+    // 防止 ECPay 重送 webhook 時重複 complete cart / capture
+    if (['authorized', 'captured', 'completed'].includes(transaction.status)) {
+      console.log(`[Webhook] Transaction ${merchantTradeNo} already ${transaction.status}, skipping (idempotent)`);
+      await supabase.from('gateway_webhook_logs').insert({
+        merchant_id: merchant.id,
+        transaction_id: transaction.id,
+        type: 'payment',
+        source_ip: req.ip,
+        raw_body: JSON.stringify(params),
+        check_mac_valid: true,
+        processed: true,
+        process_result: 'skipped_idempotent',
+        processed_at: new Date().toISOString()
+      });
+      return res.send('1|OK');
+    }
+
     // 解密憑證
     const hashKey = decrypt(merchant.ecpay_hash_key_encrypted);
     const hashIV = decrypt(merchant.ecpay_hash_iv_encrypted);
@@ -456,26 +474,29 @@ router.post('/webhook', async (req, res) => {
 
             console.log('Medusa order created:', medusaOrderId);
 
-            // 自動 Capture Payment（不影響 webhook 回應）
+            // ★ Capture 改為 fire-and-forget（非阻塞）
+            // 先讓 webhook 回 1|OK 給 ECPay，capture 在背景執行
             if (medusaOrderId) {
-              try {
-                const captureResult = await capturePayment(medusaUrl, medusaOrderId);
-                if (captureResult.success) {
-                  console.log('[Webhook] Payment captured successfully for order:', medusaOrderId);
-                  // 更新交易狀態為 captured
-                  await supabase
-                    .from('gateway_transactions')
-                    .update({
-                      status: 'captured',
-                      captured_at: new Date().toISOString()
-                    })
-                    .eq('id', transaction.id);
-                } else {
-                  console.warn('[Webhook] Payment capture skipped or failed:', captureResult.reason);
+              const txId = transaction.id;
+              setImmediate(async () => {
+                try {
+                  const captureResult = await capturePayment(medusaUrl, medusaOrderId);
+                  if (captureResult.success) {
+                    console.log('[Capture:bg] Payment captured for order:', medusaOrderId);
+                    await supabase
+                      .from('gateway_transactions')
+                      .update({
+                        status: 'captured',
+                        captured_at: new Date().toISOString()
+                      })
+                      .eq('id', txId);
+                  } else {
+                    console.warn('[Capture:bg] Capture skipped/failed:', captureResult.reason);
+                  }
+                } catch (captureErr) {
+                  console.error('[Capture:bg] Error (will retry on next check):', captureErr.message);
                 }
-              } catch (captureErr) {
-                console.error('[Webhook] Payment capture error (non-blocking):', captureErr.message);
-              }
+              });
             }
           } else {
             console.error('Medusa cart completion failed:', medusaResult.error || medusaResult);
@@ -489,34 +510,38 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // 通知商家（如果有設定 webhook_url）
+    // 通知商家（非阻塞，不影響 ECPay 回應）
     if (merchant.webhook_url) {
-      try {
-        await fetch(merchant.webhook_url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-webhook-secret': process.env.ORDER_WEBHOOK_SECRET || ''
-          },
-          body: JSON.stringify({
-            event: 'payment.completed',
-            transaction_id: transaction.id,
-            merchant_trade_no: merchantTradeNo,
-            order_id: transaction.order_id,
-            status: isSuccess ? 'authorized' : 'failed',
-            amount: transaction.amount
-          })
-        });
+      const notifyTxId = transaction.id;
+      const notifyUrl = merchant.webhook_url;
+      setImmediate(async () => {
+        try {
+          await fetch(notifyUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-webhook-secret': process.env.ORDER_WEBHOOK_SECRET || ''
+            },
+            body: JSON.stringify({
+              event: 'payment.completed',
+              transaction_id: notifyTxId,
+              merchant_trade_no: merchantTradeNo,
+              order_id: transaction.order_id,
+              status: isSuccess ? 'authorized' : 'failed',
+              amount: transaction.amount
+            })
+          });
 
-        await supabase
-          .from('gateway_webhook_logs')
-          .update({ merchant_notified: true })
-          .eq('transaction_id', transaction.id)
-          .eq('type', 'payment');
+          await supabase
+            .from('gateway_webhook_logs')
+            .update({ merchant_notified: true })
+            .eq('transaction_id', notifyTxId)
+            .eq('type', 'payment');
 
-      } catch (notifyErr) {
-        console.error('Failed to notify merchant:', notifyErr);
-      }
+        } catch (notifyErr) {
+          console.error('Failed to notify merchant:', notifyErr.message);
+        }
+      });
     }
 
     // ECPay 要求回傳 1|OK
