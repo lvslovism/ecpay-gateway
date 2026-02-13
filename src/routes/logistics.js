@@ -329,60 +329,99 @@ router.post('/shipment', authMiddleware, async (req, res) => {
     
     const apiUrl = getApiUrl('create', merchant.is_staging);
     const formBody = new URLSearchParams(params).toString();
-    
+
     console.log('Creating shipment:', { tradeNo, storeId, apiUrl });
-    
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: formBody
-    });
-    
-    const responseText = await response.text();
-    console.log('ECPay response:', responseText);
-    
-    const ecpayResult = {};
-    responseText.split('&').forEach(pair => {
-      const [key, value] = pair.split('=');
-      if (key) ecpayResult[key] = decodeURIComponent(value || '');
-    });
-    
-    if (ecpayResult.RtnCode !== '300' && ecpayResult.RtnCode !== '1') {
-      return res.status(400).json({
-        error: 'ECPay create shipment failed',
-        code: ecpayResult.RtnCode,
-        message: ecpayResult.RtnMsg
-      });
-    }
-    
-    const { data: shipment, error: insertError } = await supabase
+
+    // BUG FIX: INSERT first with 'pending' status to avoid webhook timing issue
+    // ECPay webhook can arrive before this API returns, so record must exist first
+    const { data: pendingShipment, error: insertError } = await supabase
       .from('gateway_shipments')
       .insert({
         merchant_id: merchant.id,
         transaction_id: transaction_id || null,
         merchant_trade_no: tradeNo,
-        all_pay_logistics_id: ecpayResult.AllPayLogisticsID || ecpayResult['1|AllPayLogisticsID'],
         logistics_type: 'CVS',
         logistics_sub_type: subType,
-        cvs_payment_no: ecpayResult.CVSPaymentNo,
-        cvs_validation_no: ecpayResult.CVSValidationNo,
         receiver_name,
         receiver_phone: receiver_phone || receiver_cellphone,
         receiver_store_id: storeId,
         receiver_store_name: storeName,
         sender_name,
         sender_phone: sender_phone || sender_cellphone,
-        status: 'created',
+        status: 'pending',  // Will be updated after ECPay responds
         goods_name,
         goods_amount,
         cod_amount: is_collection ? collection_amount : 0,
-        order_id: order_id || null,
-        ecpay_response: ecpayResult
+        order_id: order_id || null
       })
       .select()
       .single();
-    
-    if (insertError) throw insertError;
+
+    if (insertError) {
+      console.error('Failed to create pending shipment:', insertError);
+      throw insertError;
+    }
+
+    console.log('Created pending shipment:', pendingShipment.id);
+
+    // Now call ECPay API
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formBody
+    });
+
+    const responseText = await response.text();
+    console.log('ECPay response:', responseText);
+
+    const ecpayResult = {};
+    responseText.split('&').forEach(pair => {
+      const [key, value] = pair.split('=');
+      if (key) ecpayResult[key] = decodeURIComponent(value || '');
+    });
+
+    // BUG FIX: Accept RtnCode 2001 as success for C2C shipments
+    // RtnCode meanings: '1' = B2C success, '300' = some operations, '2001' = C2C success
+    const isSuccess = ecpayResult.RtnCode === '1' ||
+                      ecpayResult.RtnCode === '300' ||
+                      ecpayResult.RtnCode === '2001';
+
+    if (!isSuccess) {
+      // Update shipment to failed status
+      await supabase
+        .from('gateway_shipments')
+        .update({
+          status: 'failed',
+          ecpay_response: ecpayResult,
+          status_message: ecpayResult.RtnMsg
+        })
+        .eq('id', pendingShipment.id);
+
+      return res.status(400).json({
+        error: 'ECPay create shipment failed',
+        code: ecpayResult.RtnCode,
+        message: ecpayResult.RtnMsg
+      });
+    }
+
+    // Update shipment with ECPay response data
+    const { data: shipment, error: updateError } = await supabase
+      .from('gateway_shipments')
+      .update({
+        all_pay_logistics_id: ecpayResult.AllPayLogisticsID || ecpayResult['1|AllPayLogisticsID'],
+        cvs_payment_no: ecpayResult.CVSPaymentNo,
+        cvs_validation_no: ecpayResult.CVSValidationNo,
+        status: 'created',
+        ecpay_response: ecpayResult
+      })
+      .eq('id', pendingShipment.id)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('Failed to update shipment with ECPay data:', updateError);
+      throw updateError;
+    }
     
     res.json({
       success: true,
