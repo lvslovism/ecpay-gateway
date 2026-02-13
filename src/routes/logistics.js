@@ -423,15 +423,16 @@ router.post('/shipment', authMiddleware, async (req, res) => {
       throw updateError;
     }
     
+    // Return shipment data from the updated record (has correct values)
     res.json({
       success: true,
       shipment: {
         id: shipment.id,
-        merchant_trade_no: tradeNo,
-        all_pay_logistics_id: ecpayResult.AllPayLogisticsID,
-        cvs_payment_no: ecpayResult.CVSPaymentNo,
-        cvs_validation_no: ecpayResult.CVSValidationNo,
-        status: 'created'
+        merchant_trade_no: shipment.merchant_trade_no,
+        all_pay_logistics_id: shipment.all_pay_logistics_id,
+        cvs_payment_no: shipment.cvs_payment_no,
+        cvs_validation_no: shipment.cvs_validation_no,
+        status: shipment.status
       }
     });
     
