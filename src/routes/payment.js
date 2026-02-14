@@ -497,6 +497,69 @@ router.post('/webhook', async (req, res) => {
                   console.error('[Capture:bg] Error (will retry on next check):', captureErr.message);
                 }
               });
+
+              // ★ 呼叫 order-completed Edge Function（非阻塞，與 capture 平行）
+              // 累加消費 + 自動升等
+              setImmediate(async () => {
+                try {
+                  // 從 transaction metadata 取 customer_id
+                  let customerId = transaction.metadata?.customer_id;
+
+                  // 如果 metadata 沒有 customer_id，從 Medusa order 查
+                  if (!customerId) {
+                    try {
+                      const adminToken = await getMedusaAdminToken(medusaUrl);
+                      if (adminToken) {
+                        const orderRes = await fetch(`${medusaUrl}/admin/orders/${medusaOrderId}`, {
+                          headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${adminToken}`
+                          }
+                        });
+                        if (orderRes.ok) {
+                          const orderData = await orderRes.json();
+                          customerId = orderData.order?.customer_id || orderData.order?.customer?.id;
+                        }
+                      }
+                    } catch (e) {
+                      console.error('[Tier] Failed to get customer_id from order:', e.message);
+                    }
+                  }
+
+                  if (customerId) {
+                    const supabaseUrl = process.env.SUPABASE_URL;
+                    const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+
+                    if (supabaseUrl && supabaseKey) {
+                      const response = await fetch(`${supabaseUrl}/functions/v1/order-completed`, {
+                        method: 'POST',
+                        headers: {
+                          'Content-Type': 'application/json',
+                          'Authorization': `Bearer ${supabaseKey}`,
+                          'x-webhook-secret': process.env.ORDER_WEBHOOK_SECRET || ''
+                        },
+                        body: JSON.stringify({
+                          order_id: medusaOrderId,
+                          customer_id: customerId,
+                          order_total: parseFloat(transaction.amount),
+                          source: 'gateway_webhook'
+                        })
+                      });
+
+                      const result = await response.json();
+                      if (result.tier_changed) {
+                        console.log(`[Tier] Customer ${customerId} upgraded to ${result.new_tier}`);
+                      } else if (result.skipped) {
+                        console.log(`[Tier] Order ${medusaOrderId} already processed`);
+                      }
+                    }
+                  } else {
+                    console.warn('[Tier] No customer_id available, skipping tier update');
+                  }
+                } catch (err) {
+                  console.error('[Tier] order-completed call failed:', err.message);
+                }
+              });
             }
           } else {
             console.error('Medusa cart completion failed:', medusaResult.error || medusaResult);
