@@ -518,7 +518,16 @@ router.post('/webhook', async (req, res) => {
                         });
                         if (orderRes.ok) {
                           const orderData = await orderRes.json();
-                          customerId = orderData.order?.customer_id || orderData.order?.customer?.id;
+                          console.log('[Tier] Medusa order response keys:', JSON.stringify(Object.keys(orderData)));
+                          console.log('[Tier] Medusa order customer_id field:', orderData.order?.customer_id ?? orderData.customer_id ?? 'not found');
+                          // Medusa v2: response body 直接是 order 物件（無 .order wrapper）
+                          // Medusa v1: response body 是 { order: { ... } }
+                          customerId = orderData.order?.customer_id
+                            || orderData.customer_id
+                            || orderData.order?.customer?.id
+                            || orderData.customer?.id;
+                        } else {
+                          console.error('[Tier] Medusa order API returned:', orderRes.status);
                         }
                       }
                     } catch (e) {
