@@ -5,3 +5,6 @@ dist/
 
 project-source-dump.txt
 repomix-output.xml
+
+# Claude Code local settings
+.claude/settings.local.json
