@@ -1,0 +1,7 @@
+﻿node_modules/
+.env
+.env.local
+dist/
+
+project-source-dump.txt
+repomix-output.xml
