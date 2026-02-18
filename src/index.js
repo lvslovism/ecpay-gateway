@@ -17,10 +17,13 @@ app.use(cors({
     if (!origin) return callback(null, true);
 
     const allowedOrigins = [
-      'https://admin.astrapath-marketing.com'
+      'https://shop.minjie0326.com',
+      'https://admin.astrapath-marketing.com',
+      'https://liff.line.me'
     ];
     const allowedPatterns = [
       /\.vercel\.app$/,        // Vercel preview deployments
+      /\.liff\.line\.me$/,     // LIFF sub-domains
       /localhost:\d+$/         // 本地開發
     ];
 
