@@ -5,12 +5,33 @@ const cors = require('cors');
 const paymentRoutes = require('./routes/payment');
 const logisticsRoutes = require('./routes/logistics');
 const merchantRoutes = require('./routes/merchants');
+const adminRoutes = require('./routes/admin');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: function (origin, callback) {
+    // 允許無 origin 的請求（server-to-server, ECPay webhook, curl 等）
+    if (!origin) return callback(null, true);
+
+    const allowedOrigins = [
+      'https://admin.astrapath-marketing.com'
+    ];
+    const allowedPatterns = [
+      /\.vercel\.app$/,        // Vercel preview deployments
+      /localhost:\d+$/         // 本地開發
+    ];
+
+    if (allowedOrigins.includes(origin) || allowedPatterns.some(p => p.test(origin))) {
+      return callback(null, true);
+    }
+
+    callback(null, false);
+  },
+  credentials: true
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // ECPay Webhook 用
 
@@ -23,6 +44,7 @@ app.get('/health', (req, res) => {
 app.use('/api/v1/payment', paymentRoutes);
 app.use('/api/v1/logistics', logisticsRoutes);
 app.use('/api/v1/merchants', merchantRoutes);
+app.use('/api/v1/admin', adminRoutes);
 
 // 404 handler
 app.use((req, res) => {
